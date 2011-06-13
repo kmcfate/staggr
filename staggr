@@ -1,0 +1,315 @@
+#!/usr/bin/php
+
+<?
+require_once "System/Daemon.php";
+
+class staggr{
+    private $hosts=array();
+    private $stats=array();
+    private $capacity=array();
+
+    public function staggr()
+    {
+        $this->refresh();
+    }
+
+    public function refresh()
+    {
+        // Currently hard coded host list.
+        // Format is poolname followed by list of ip:80
+        // can be easily modified
+        $fh=fopen("/tmp/pool.cache", "r");
+        $poolage = microtime(true);
+        $this->pools=array();
+        $this->hosts=array();
+        $curpool='';
+        while(($info = fgets($fh)) !== false)
+        {
+            if(preg_match("/:80$/", $info))
+            {
+                if(!empty($curpool)){
+                    # ip address
+                    $this->hosts[]=array('pool' => trim($curpool), 'ip' => trim($info));
+                }
+            }else{
+                $curpool=$info;
+            }
+        }
+    }
+
+    private function parse($str, $pool, $host)
+    {
+        $str = str_replace(array("\r","\n"), "", $str);
+
+        $reg='~<tr><td><b>(.*)<\/b><\/td><td>(.*)<\/td><td>(.*)<\/td>';
+        $reg.='<td>(.*)<\/td><td>(.*)<\/td><td>(.*)<\/td><td>(.*)<\/td>';
+        $reg.='<td>(.*)<\/td><td>(.*)<\/td><td>(.*)<\/td><td>(.*)<\/td>';
+        $reg.='<td nowrap>(.*)<\/td><td nowrap>(.*)<\/td><\/tr>~Ui';
+        preg_match_all($reg, $str, $matches);
+
+        $reg_raw='~<pre>(.*)</pre>~Ui';
+        preg_match_all($reg_raw, $str, $matches_raw);
+
+        if(empty($this->capacity[$pool])){
+            $this->capacity[$pool]['total']=0;
+            $this->capacity[$pool]['idle']=0;
+            $this->capacity[$pool]['used']=0;
+            $this->capacity[$pool]['keep']=0;
+            $this->capacity[$pool]['free']=0;
+            $this->capacity[$pool]['good']=0;
+            $this->capacity[$pool]['error']=0;
+            $this->capacity[$pool]['nodes']=0;
+            $this->capacity[$pool]['slow']=0;
+            $this->capacity[$pool]['ms']=array();
+            $this->capacity[$pool]['vhosts']=array();
+            $this->capacity[$pool]['clients']=array();
+            $this->capacity[$pool]['requests']=array();
+        }
+
+        $c = count($matches[0]);
+        if( $c > 0 )
+        {
+            $slots = strlen($matches_raw[1][0]);
+            $idleslots = preg_match_all('/_/', $matches_raw[1][0], $junk);
+            $usedslots = preg_match_all('/[A-JL-Z]/', $matches_raw[1][0], $junk);
+            $keepslots = preg_match_all('/K/', $matches_raw[1][0], $junk);
+            $freeslots = $slots-$idleslots-$usedslots-$keepslots;
+            $this->capacity[$pool]['total']+=$slots;
+            $this->capacity[$pool]['idle']+=$idleslots;
+            $this->capacity[$pool]['used']+=$usedslots;
+            $this->capacity[$pool]['free']+=$freeslots;
+            $this->capacity[$pool]['keep']+=$keepslots;
+            $this->capacity[$pool]['good']++;
+
+            for($i=1;$i<$c;$i++)
+            {
+                $this->stats[$pool]['result'][]=array('srv' => $matches[1][$i],
+                    'pid' => $matches[2][$i],
+                    'acc' => $matches[3][$i],
+                    'm' => strip_tags($matches[4][$i]),
+                    'cpu' => $matches[5][$i],
+                    'ss' => $matches[6][$i],
+                    'req' => $matches[7][$i],
+                    'conn' => $matches[8][$i],
+                    'child' => $matches[9][$i],
+                    'slot' => $matches[10][$i],
+                    'client' => $matches[11][$i],
+                    'vhost' => $matches[12][$i],
+                    'request' => $matches[13][$i],
+                    'slots' => $slots,
+                    'idleslots' => $idleslots,
+                    'usedslots' => $usedslots);
+
+                if (preg_match("/^[A-Z]$/", strip_tags($matches[4][$i])))
+                {
+                    @$this->capacity[$pool]['vhosts'][$matches[12][$i]]++;
+                    @$this->capacity[$pool]['clients'][$matches[11][$i]]++;
+                    @$this->capacity[$pool]['requests'][$matches[13][$i]]++;
+                    if($matches[6][$i]>30){
+                        $this->capacity[$pool]['slow']++;
+                    }
+                }else{
+                    if($matches[6][$i]<10) $this->capacity[$pool]['ms'][]=$matches[7][$i];
+                }
+            }
+
+        }else{
+            $this->capacity[$pool]['error']++;
+        }
+        $this->capacity[$pool]['nodes']++;
+    }
+
+    private function request($host)
+    {
+        $timeout = 5;
+        $s = @stream_socket_client("$host", $errno, $errstr, $timeout,
+            STREAM_CLIENT_ASYNC_CONNECT|STREAM_CLIENT_CONNECT);
+        if($s){
+            return($s);
+        }else{
+            return false;
+        }
+    }
+
+    public function gather()
+    {
+        $slow=array();
+        $failed=array();
+        $this->stats=array();
+        $this->capacity=array();
+        foreach ($this->hosts as $id => $host) {
+            $sockets[$id] = $this->request($host['ip']);
+            if(!$sockets[$id])unset($sockets[$id]);
+            $connecting[$id] = $sockets[$id];
+            $status[$id]='';
+        }
+        /* Now, wait for the results to come back in */
+        while (count($sockets)) {
+            $read = $sockets;
+            $write = $connecting;
+            /* This is the magic function - explained below */
+            $n = stream_select($read, $write, $except = null, 1);
+            /* readable sockets either have data for us, or are failed
+             * connection attempts */
+            if($n){
+                foreach ($read as $r) {
+                    $id = array_search($r, $sockets);
+                    $data = fread($r, 8192);
+                    if (strlen($data) == 0) {
+                        fclose($r);
+                        $this->parse($status[$id], $this->hosts[$id]['pool'], $this->hosts[$id]['ip']);
+                        unset($sockets[$id]);
+                        //$sockets[$id] = CreateRequest($host);
+                        //$status[$id] = "connecting";
+                        //usleep(10000);
+                    } else {
+                        $status[$id] .= $data;
+                    }
+                }
+                foreach ($write as $w){
+                    $id = array_search($w, $sockets);
+                    if(!@fwrite($w, "GET /server-status HTTP/1.0\r\n\r\n")){
+                        echo "error connecting to ".$hosts[$id]."\n";
+                        $sockets[$id] = $this->request($host);
+                        $connecting[$id] = $sockets[$id];
+                        $status[$id]='';
+                    }else{
+                        unset($connecting[$id]);
+                    }
+                }
+                usleep(1);
+            }else{
+                if(empty($slow)){
+                    foreach ($sockets as $id => $s){
+                        $slow[]=$id;
+                    }
+                }else{
+                    foreach ($sockets as $id => $s){
+                        fclose($s);
+                        $failed[]=$id;
+                        $this->parse($status[$id], $this->hosts[$id]['pool'], $this->hosts[$id]['ip']);
+                        unset($sockets[$id]);
+                    }
+                }
+            }
+        }#while (count($sockets))
+        ksort($this->capacity);
+        $pools=array_keys($this->capacity);
+        foreach($pools as $pool)
+        {
+            $counts=array('clients','vhosts','requests');
+            foreach($counts as $count)
+            {
+                arsort($this->capacity[$pool][$count]);
+                array_splice($this->capacity[$pool][$count], 10);
+            }
+            $this->capacity[$pool]['ms']=$this->percentile($this->capacity[$pool]['ms'], 85);
+        }
+        return $this->capacity;
+    }
+
+    private function percentile($data,$percentile){
+        if( 0 < $percentile && $percentile < 1 ) {
+            $p = $percentile;
+        }else if( 1 < $percentile && $percentile <= 100 ) {
+            $p = $percentile * .01;
+        }else {
+            return "";
+        }
+        $count = count($data);
+        $allindex = ($count-1)*$p;
+        $intvalindex = intval($allindex);
+        $floatval = $allindex - $intvalindex;
+        sort($data);
+        if(!is_float($floatval)){
+            $result = $data[$intvalindex];
+        }else {
+            if($count > $intvalindex+1)
+                $result = $floatval*($data[$intvalindex+1] - $data[$intvalindex]) + $data[$intvalindex];
+            else
+                $result = $data[$intvalindex];
+        }
+        return $result;
+    }
+
+}
+
+
+##############################################################################
+#
+
+// Allowed arguments & their defaults
+$runmode = array(
+    'no-daemon' => false,
+    'help' => false,
+    'write-initd' => false,
+);
+
+// Scan command line attributes for allowed arguments
+foreach ($argv as $k=>$arg) {
+    if (substr($arg, 0, 2) == '--' && isset($runmode[substr($arg, 2)])) {
+        $runmode[substr($arg, 2)] = true;
+    }
+}
+
+// Help mode. Shows allowed argumentents and quit directly
+if ($runmode['help'] == true) {
+    echo 'Usage: '.$argv[0].' [runmode]' . "\n";
+    echo 'Available runmodes:' . "\n";
+    foreach ($runmode as $runmod=>$val) {
+        echo ' --'.$runmod . "\n";
+    }
+    die();
+}
+
+$options = array(
+    'appName' => 'staggr',
+    'appDir' => dirname(__FILE__),
+    'appDescription' => 'Parses server-status pages for all web nodes',
+    'authorName' => 'Kal McFate',
+    'authorEmail' => 'kal.mcfate@rackspace.com',
+    'sysMaxExecutionTime' => '0',
+    'sysMaxInputTime' => '0',
+    'sysMemoryLimit' => '1024M',
+    'appRunAsGID' => 99,
+    'appRunAsUID' => 99,
+);
+
+System_Daemon::setOptions($options);
+
+if (!$runmode['no-daemon']) {
+    System_Daemon::start();
+}
+
+if (!$runmode['write-initd']) {
+    System_Daemon::info('not writing an init.d script this time');
+} else {
+    if (($initd_location = System_Daemon::writeAutoRun()) === false) {
+        System_Daemon::notice('unable to write init.d script');
+    } else {
+        System_Daemon::info(
+            'sucessfully written startup script: %s',
+            $initd_location
+        );
+    }
+}
+
+
+$staggr=new staggr;
+while(!System_Daemon::isDying())
+{
+
+    $capacity=$staggr->gather();
+    // Just using a file for client to read, since we run multiple client
+    $fh=fopen("/tmp/staggr.obj.tmp",'w');
+    fwrite($fh,serialize($capacity));
+    fclose($fh);
+    rename("/tmp/staggr.obj.tmp","/tmp/staggr.obj");
+    $staggr->refresh();
+    System_Daemon::iterate(5);
+
+}
+
+##############################################################################
+
+?>

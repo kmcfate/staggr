@@ -1,0 +1,176 @@
+#!/usr/bin/php
+
+<?
+
+class console
+{
+    protected $color = array(
+        'gray'          => 30,
+        'black'         => 30,
+        'red'           => 31,
+        'green'         => 32,
+        'yellow'        => 33,
+        'blue'          => 34,
+        'magenta'       => 35,
+        'cyan'          => 36,
+        'white'         => 37,
+        'default'       => 39
+    );
+
+    protected $bgcolor = array(
+        'gray'       => 40,
+        'black'      => 40,
+        'red'        => 41,
+        'green'      => 42,
+        'yellow'     => 43,
+        'blue'       => 44,
+        'magenta'    => 45,
+        'cyan'       => 46,
+        'white'      => 47,
+        'default'    => 49,
+    );
+
+    protected $style = array(
+        'default'           => '0',
+
+        'bold'              => 1,
+        'faint'             => 2,
+        'normal'            => 22,
+
+        'italic'            => 3,
+        'notitalic'         => 23,
+
+        'underlined'        => 4,
+        'doubleunderlined'  => 21,
+        'notunderlined'     => 24,
+
+        'blink'             => 5,
+        'blinkfast'         => 6,
+        'noblink'           => 25,
+
+        'negative'          => 7,
+        'positive'          => 27,
+    );
+
+    // Input
+    public function readnum()
+    {
+        $stdin = fopen('php://stdin', 'r');
+        $line = trim(fgets($stdin));
+        fscanf($stdin, "%d\n", $number);
+        return $number;
+    }
+    public function readstr()
+    {
+        $stdin = fopen('php://stdin', 'r');
+        $line = trim(fgets($stdin));
+        fscanf($stdin, "%s\n", $string);
+        return $string;
+    }
+
+    // Cursor position
+    public function xy( $row = 1, $column = 1 )     { return "\033[{$row};{$column}H"; }
+    public function u($lines=1)                     { return "\033[{$lines}A"; }
+    public function d($lines=1)                     { return "\033[{$lines}B"; }
+    public function r($columns=1)                   { return "\033[{$columns}C"; }
+    public function l($columns=1)                   { return "\033[{$columns}D"; }
+
+    // Text colors
+    public function fx($style='default')          { return "\033[".$this->style[$style]."m"; }
+    public function fg($color='default')          { return "\033[".$this->color[$color]."m"; }
+    public function bg($color='default')          { return "\033[".$this->bgcolor[$color]."m"; }
+
+    // Other
+    public function cls()                             { return "\033c"; }
+    public function cld()                             { return "\033[J"; }
+    public function clr()                             { return "\033[K"; }
+}
+
+class scaler
+{
+    protected $modifier=0;
+
+    public function scaler($mod=0)
+    {
+        $this->modifier=$mod;
+    }
+
+    public function s($char=' ', $count=1)
+    {
+        return str_repeat($char,round($count*$this->modifier));
+    }
+}
+##############################################################################
+#
+
+$sensitivity=0.20;
+$fallout=2;
+//kinda useless
+$mslimit=2000;
+$slowlimit=0.80;
+
+$nwidth=24;
+
+
+$c=new console;
+echo $c->cls();
+echo "Please wait...\n";
+echo $c->cls();
+$sdd=new scaler;
+while(true)
+{
+    $file="/tmp/staggr.obj";
+    clearstatcache();
+    $fh=fopen($file,'r');
+    $capacity=unserialize(fread($fh,filesize($file)));
+    fclose($fh);
+    echo $c->xy(0,0).$c->clr();
+    $width=`tput cols`;
+    $height=`tput lines`;
+    $bwidth=$width-$nwidth-9;
+    $swidth=round(($bwidth-34)/3);
+    $swidth=$swidth>32?32:$swidth;
+    $lines=$height-2;
+    $lastupdate=filemtime($file);
+    if(time()-$lastupdate>60){
+        echo $c->fx('bold').$c->fg('red')."Please check daemon, file data is old!\n".$c->fg().$c->fx();
+        $lines--;
+    }
+    echo "poolute --- ".date("F j, Y, g:i:s a",$lastupdate)."\n";
+    foreach($capacity as $pool => $data){
+        if($data['good']&&$data['total']){
+            $usage=$data['used']/$data['total'];
+            $slowpct=$data['slow']/$data['used'];
+            $broken=($data['total']/$data['good'])*$data['error'];
+        }else{
+            $usage=$slowpct=0;
+            $broken=1;
+        }
+        $response=$data['ms'];
+        if(($usage>=$sensitivity || $data['error']>=$fallout || $response > $mslimit || $slowpct > $slowlimit ) && $data['nodes']>0)
+        {
+            $s=new scaler($bwidth/($data['total']+$broken));
+            $nodecolor=$data['error']>2?$c->fx('bold').$c->fg('red'):$data['error']>0?$c->fx('bold').$c->fg('yellow'):$c->fg();
+            printf("{$c->clr()}{$c->fx()}{$c->fg()}%{$nwidth}.{$nwidth}s {$nodecolor}%2d/%2d{$c->fg()}{$c->fx('bold')}[{$c->fg('red')}%s{$c->fg('yellow')}%s{$c->fg('green')}%s{$c->fg()}%s{$c->fg('magenta')}%s{$c->fx()}]\n",
+                $pool, $data['good'], $data['good']+$data['error'], $s->s('#',$data['used']), $s->s('=',$data['keep']), $s->s('-',$data['idle']), $s->s(' ',$data['free']), $s->s('X',$broken));
+            $counts=array('clients','vhosts','requests');
+            printf("{$c->clr()}%{$nwidth}.{$nwidth}s [ %d ms | %d/%d slow/total ]\n",$pool, $response, $data['slow'], $data['used']);
+            for($x=1;$x<=4;$x++)
+            {
+                list(list($ip, $ipcount), list($vhost,$vhostcount),list($url, $urlcount))=array(each($capacity[$pool]['clients']),each($capacity[$pool]['vhosts']),each($capacity[$pool]['requests']));
+                printf("{$c->clr()}%{$nwidth}.{$nwidth}s [ %4d %15s | %4d %".$swidth.".".$swidth."s | %4d %".($swidth*2).".".($swidth*2)."s ]\n", $pool, $ipcount, $ip, $vhostcount, $vhost, $urlcount, $url);
+            }
+            $lines-=6;
+        }
+    }
+    while($lines>0){
+        echo $c->clr()."\n";
+        $lines--;
+    }
+    sleep(5);
+
+}
+
+##############################################################################
+
+?>
