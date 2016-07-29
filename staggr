@@ -1,8 +1,6 @@
 #!/usr/bin/php
 
-<?
-require_once "System/Daemon.php";
-
+<?php
 class staggr{
     private $hosts=array();
     private $stats=array();
@@ -16,7 +14,7 @@ class staggr{
     public function refresh()
     {
         // Currently hard coded host list.
-        // Format is poolname followed by list of ip:80
+        // Format is poolname followed by list of ip:80/server-status-url
         // can be easily modified
         $fh=fopen("/tmp/pool.cache", "r");
         $poolage = microtime(true);
@@ -25,11 +23,13 @@ class staggr{
         $curpool='';
         while(($info = fgets($fh)) !== false)
         {
-            if(preg_match("/:80$/", $info))
+            if(preg_match("/:80/", $info))
             {
+   	    list($ip, $url)=explode('/', $info, 2);
+	    $url=trim($url);
                 if(!empty($curpool)){
                     # ip address
-                    $this->hosts[]=array('pool' => trim($curpool), 'ip' => trim($info));
+                    $this->hosts[]=array('pool' => trim($curpool), 'ip' => $ip, 'url' => $url);
                 }
             }else{
                 $curpool=$info;
@@ -59,7 +59,7 @@ class staggr{
             $this->capacity[$pool]['good']=0;
             $this->capacity[$pool]['error']=0;
             $this->capacity[$pool]['nodes']=0;
-            $this->capacity[$pool]['slow']=0;
+            $this->capacity[$pool]['waits']=array();
             $this->capacity[$pool]['ms']=array();
             $this->capacity[$pool]['vhosts']=array();
             $this->capacity[$pool]['clients']=array();
@@ -102,11 +102,13 @@ class staggr{
 
                 if (preg_match("/^[A-Z]$/", strip_tags($matches[4][$i])))
                 {
-                    @$this->capacity[$pool]['vhosts'][$matches[12][$i]]++;
-                    @$this->capacity[$pool]['clients'][$matches[11][$i]]++;
-                    @$this->capacity[$pool]['requests'][$matches[13][$i]]++;
-                    if($matches[6][$i]>30){
-                        $this->capacity[$pool]['slow']++;
+                    if($matches[4][$i]=='K'){
+                      if($matches[7][$i]!=0) $this->capacity[$pool]['ms'][]=$matches[7][$i];
+                    }else{
+                      @$this->capacity[$pool]['vhosts'][$matches[12][$i]]++;
+                      @$this->capacity[$pool]['clients'][$matches[11][$i]]++;
+                      @$this->capacity[$pool]['requests'][$matches[13][$i]]++;
+                      $this->capacity[$pool]['waits'][]=$matches[6][$i];
                     }
                 }else{
                     if($matches[6][$i]<10) $this->capacity[$pool]['ms'][]=$matches[7][$i];
@@ -148,7 +150,8 @@ class staggr{
             $read = $sockets;
             $write = $connecting;
             /* This is the magic function - explained below */
-            $n = stream_select($read, $write, $except = null, 1);
+	    $except = null;
+            $n = @stream_select($read, $write, $except, 1);
             /* readable sockets either have data for us, or are failed
              * connection attempts */
             if($n){
@@ -168,7 +171,7 @@ class staggr{
                 }
                 foreach ($write as $w){
                     $id = array_search($w, $sockets);
-                    if(!@fwrite($w, "GET /server-status HTTP/1.0\r\n\r\n")){
+                    if(!@fwrite($w, "GET /".$this->hosts[$id]['url']." HTTP/1.0\r\n\r\n")){
                         echo "error connecting to ".$hosts[$id]."\n";
                         $sockets[$id] = $this->request($host);
                         $connecting[$id] = $sockets[$id];
@@ -203,7 +206,8 @@ class staggr{
                 arsort($this->capacity[$pool][$count]);
                 array_splice($this->capacity[$pool][$count], 10);
             }
-            $this->capacity[$pool]['ms']=$this->percentile($this->capacity[$pool]['ms'], 85);
+            $this->capacity[$pool]['ms']=$this->percentile($this->capacity[$pool]['ms'], 50);
+            $this->capacity[$pool]['waits']=$this->percentile($this->capacity[$pool]['waits'], 50);
         }
         return $this->capacity;
     }
@@ -217,6 +221,7 @@ class staggr{
             return "";
         }
         $count = count($data);
+	if($count==0) return "";
         $allindex = ($count-1)*$p;
         $intvalindex = intval($allindex);
         $floatval = $allindex - $intvalindex;
@@ -238,65 +243,9 @@ class staggr{
 ##############################################################################
 #
 
-// Allowed arguments & their defaults
-$runmode = array(
-    'no-daemon' => false,
-    'help' => false,
-    'write-initd' => false,
-);
-
-// Scan command line attributes for allowed arguments
-foreach ($argv as $k=>$arg) {
-    if (substr($arg, 0, 2) == '--' && isset($runmode[substr($arg, 2)])) {
-        $runmode[substr($arg, 2)] = true;
-    }
-}
-
-// Help mode. Shows allowed argumentents and quit directly
-if ($runmode['help'] == true) {
-    echo 'Usage: '.$argv[0].' [runmode]' . "\n";
-    echo 'Available runmodes:' . "\n";
-    foreach ($runmode as $runmod=>$val) {
-        echo ' --'.$runmod . "\n";
-    }
-    die();
-}
-
-$options = array(
-    'appName' => 'staggr',
-    'appDir' => dirname(__FILE__),
-    'appDescription' => 'Parses server-status pages for all web nodes',
-    'authorName' => 'Kal McFate',
-    'authorEmail' => 'kal.mcfate@rackspace.com',
-    'sysMaxExecutionTime' => '0',
-    'sysMaxInputTime' => '0',
-    'sysMemoryLimit' => '1024M',
-    'appRunAsGID' => 99,
-    'appRunAsUID' => 99,
-);
-
-System_Daemon::setOptions($options);
-
-if (!$runmode['no-daemon']) {
-    System_Daemon::start();
-}
-
-if (!$runmode['write-initd']) {
-    System_Daemon::info('not writing an init.d script this time');
-} else {
-    if (($initd_location = System_Daemon::writeAutoRun()) === false) {
-        System_Daemon::notice('unable to write init.d script');
-    } else {
-        System_Daemon::info(
-            'sucessfully written startup script: %s',
-            $initd_location
-        );
-    }
-}
-
 
 $staggr=new staggr;
-while(!System_Daemon::isDying())
+while(true)
 {
 
     $capacity=$staggr->gather();
@@ -306,7 +255,7 @@ while(!System_Daemon::isDying())
     fclose($fh);
     rename("/tmp/staggr.obj.tmp","/tmp/staggr.obj");
     $staggr->refresh();
-    System_Daemon::iterate(5);
+    sleep(5);
 
 }
 

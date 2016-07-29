@@ -1,6 +1,6 @@
 #!/usr/bin/php
 
-<?
+<?php
 
 class console
 {
@@ -103,14 +103,14 @@ class scaler
 ##############################################################################
 #
 
-$sensitivity=0.20;
+$sensitivity=0.00;
 $fallout=2;
 //kinda useless
 $mslimit=2000;
 $slowlimit=0.80;
 
 $nwidth=24;
-
+date_default_timezone_set("UTC");
 
 $c=new console;
 echo $c->cls();
@@ -139,6 +139,7 @@ while(true)
     echo "poolute --- ".date("F j, Y, g:i:s a",$lastupdate)."\n";
     foreach($capacity as $pool => $data){
         if($data['good']&&$data['total']){
+            $data['slow']=0;
             $usage=$data['used']/$data['total'];
             $slowpct=$data['slow']/$data['used'];
             $broken=($data['total']/$data['good'])*$data['error'];
